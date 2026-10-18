@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { BaseRepository } from '../../common/base.repository';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class ChatMessageRepository extends BaseRepository {
@@ -8,12 +9,13 @@ export class ChatMessageRepository extends BaseRepository {
     super(prisma.chatMessage, 'messageId');
   }
 
-  findByOrder(orderId: string, skip = 0, take = 50) {
+  findByOrder(orderId: string, skip = 0, take = 50, cursor?: string) {
     return this.prisma.chatMessage.findMany({
       where: { orderId },
-      skip,
+      skip: cursor ? 1 : skip,
       take,
-      orderBy: { timestamp: 'asc' },
+      ...(cursor ? { cursor: { messageId: cursor } } : {}),
+      orderBy: [{ timestamp: 'asc' }, { messageId: 'asc' }],
     });
   }
 
@@ -24,15 +26,37 @@ export class ChatMessageRepository extends BaseRepository {
     });
   }
 
+  async cursorBelongsToOrder(orderId: string, cursor: string): Promise<boolean> {
+    return Boolean(
+      await this.prisma.chatMessage.findFirst({
+        where: { orderId, messageId: cursor },
+        select: { messageId: true },
+      }),
+    );
+  }
+
+  async createIdempotent(data: {
+    orderId: string;
+    senderId: string;
+    content: string;
+    clientMessageId?: string;
+  }) {
+    if (!data.clientMessageId) return this.create(data as Record<string, unknown>);
+    return this.prisma.chatMessage.upsert({
+      where: {
+        orderId_senderId_clientMessageId: {
+          orderId: data.orderId,
+          senderId: data.senderId,
+          clientMessageId: data.clientMessageId,
+        },
+      } as Prisma.ChatMessageWhereUniqueInput,
+      create: data,
+      update: {},
+    });
+  }
   async markDelivered(orderId: string, recipientId: string) {
     const participants = await this.findOrderParticipants(orderId);
-    if (
-      !participants ||
-      (participants.buyerId !== recipientId &&
-        participants.sellerId !== recipientId)
-    ) {
-      return null;
-    }
+    if (!participants || (participants.buyerId !== recipientId && participants.sellerId !== recipientId)) return null;
     const preference = await this.prisma.appUser.findUnique({
       where: { userId: recipientId },
       select: { messageReceiptsEnabled: true },
@@ -44,7 +68,6 @@ export class ChatMessageRepository extends BaseRepository {
       select: { messageId: true },
     });
     if (messages.length === 0) return null;
-
     const updatedAt = new Date();
     const messageIds = messages.map(({ messageId }) => messageId);
     await this.prisma.chatMessage.updateMany({
@@ -56,12 +79,7 @@ export class ChatMessageRepository extends BaseRepository {
 
   async markRead(orderId: string, readerId: string) {
     const participants = await this.findOrderParticipants(orderId);
-    if (
-      !participants ||
-      (participants.buyerId !== readerId && participants.sellerId !== readerId)
-    ) {
-      return null;
-    }
+    if (!participants || (participants.buyerId !== readerId && participants.sellerId !== readerId)) return null;
     const preference = await this.prisma.appUser.findUnique({
       where: { userId: readerId },
       select: { messageReceiptsEnabled: true },
@@ -73,7 +91,6 @@ export class ChatMessageRepository extends BaseRepository {
       select: { messageId: true },
     });
     if (messages.length === 0) return null;
-
     const updatedAt = new Date();
     const messageIds = messages.map(({ messageId }) => messageId);
     await this.prisma.chatMessage.updateMany({
@@ -82,4 +99,5 @@ export class ChatMessageRepository extends BaseRepository {
     });
     return { orderId, messageIds, state: 'read' as const, updatedAt };
   }
+
 }

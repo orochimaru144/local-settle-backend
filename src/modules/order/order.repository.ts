@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { ConflictException, Injectable } from '@nestjs/common';
 import { BaseRepository } from '../../common/base.repository';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { Order, Prisma } from '@prisma/client';
@@ -50,6 +50,33 @@ export class OrderRepository extends BaseRepository {
     };
   }): Promise<Order & { escrowId: string | null }> {
     const created = await this.prisma.$transaction(async (tx) => {
+      // Lock the offer row so concurrent orders cannot reserve the same remaining amount.
+      const [offer] = await tx.$queryRaw<
+        Array<{ max_amount: Prisma.Decimal; min_amount: Prisma.Decimal; status: string }>
+      >`SELECT max_amount, min_amount, status FROM offer WHERE offer_id = ${data.offerId}::uuid FOR UPDATE`;
+      if (!offer || offer.status !== 'active') {
+        throw new ConflictException('Offer is unavailable');
+      }
+
+      const requestedAmount = new Prisma.Decimal(data.assetAmount);
+      const minAmount = new Prisma.Decimal(offer.min_amount);
+      const maxAmount = new Prisma.Decimal(offer.max_amount);
+      const now = new Date();
+      const reserved = await tx.order.aggregate({
+        where: {
+          offerId: data.offerId,
+          orderStatus: { in: ['created', 'locked', 'disputed'] },
+          OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+        },
+        _sum: { assetAmount: true },
+      });
+      const usedAmount = reserved._sum.assetAmount ?? new Prisma.Decimal(0);
+      const remaining = maxAmount.minus(usedAmount);
+      if (requestedAmount.lessThan(minAmount) || requestedAmount.greaterThan(remaining)) {
+        throw new ConflictException(
+          `Order amount must be at least ${minAmount.toString()} and no more than the remaining offer amount ${remaining.toString()}`,
+        );
+      }
       const payload = {
         ...(data.orderId ? { orderId: data.orderId } : {}),
         offerId: data.offerId,
@@ -79,15 +106,29 @@ export class OrderRepository extends BaseRepository {
         escrowId = escrow.escrowId;
       }
 
-      // Mark the offer as executed so it no longer appears in the active market
+      const totalReserved = usedAmount.plus(requestedAmount);
       await tx.offer.update({
         where: { offerId: data.offerId },
-        data: { executed: true },
+        data: { executed: totalReserved.greaterThanOrEqualTo(maxAmount) },
       });
       return { ...order, escrowId };
     });
 
     return created;
+  }
+
+  async cancelAndReleaseReservation(orderId: string): Promise<Order> {
+    return this.prisma.$transaction(async (tx) => {
+      const order = await tx.order.update({
+        where: { orderId },
+        data: { orderStatus: ORDER_STATUS.CANCELLED },
+      });
+      await tx.offer.updateMany({
+        where: { offerId: order.offerId, executed: true },
+        data: { executed: false },
+      });
+      return order;
+    });
   }
 
   search(
@@ -102,6 +143,22 @@ export class OrderRepository extends BaseRepository {
       orderBy: { orderId: 'desc' },
       include: ORDER_DETAIL_INCLUDE,
     });
+  }
+
+  async searchPage(where: Record<string, unknown>, skip = 0, take = 20) {
+    const [items, total] = await Promise.all([
+      this.search(where, skip, take),
+      this.prisma.order.count({ where: where as Prisma.OrderWhereInput }),
+    ]);
+    const hasMore = skip + items.length < total;
+    return {
+      items,
+      total,
+      skip,
+      take,
+      hasMore,
+      nextSkip: hasMore ? skip + items.length : null,
+    };
   }
 
   findById(id: string): Promise<OrderWithRelations | null> {
