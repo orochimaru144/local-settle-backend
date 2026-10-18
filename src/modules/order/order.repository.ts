@@ -50,25 +50,12 @@ export class OrderRepository extends BaseRepository {
     };
   }): Promise<Order & { escrowId: string | null }> {
     const created = await this.prisma.$transaction(async (tx) => {
-      const payload = {
-        ...(data.orderId ? { orderId: data.orderId } : {}),
-        offerId: data.offerId,
-        buyerId: data.buyerId,
-        sellerId: data.sellerId,
-        assetAmount: data.assetAmount,
-        fiatAmount: data.fiatAmount,
-        orderStatus: data.orderStatus || undefined,
-        expiresAt: data.expiresAt ? new Date(data.expiresAt) : undefined,
-      } as Prisma.OrderUncheckedCreateInput;
-
-      // Serialize capacity checks for a given offer. Without the row lock two
-      // concurrent buyers can both observe the same remaining amount.
+      // Lock the offer row so concurrent orders cannot reserve the same remaining amount.
       const [offer] = await tx.$queryRaw<
-        Array<{ max_amount: Prisma.Decimal; min_amount: Prisma.Decimal }>
-      >`SELECT max_amount, min_amount FROM offer WHERE offer_id = ${data.offerId}::uuid FOR UPDATE`;
-
-      if (!offer) {
-        throw new ConflictException(`Offer ${data.offerId} is unavailable`);
+        Array<{ max_amount: Prisma.Decimal; min_amount: Prisma.Decimal; status: string }>
+      >`SELECT max_amount, min_amount, status FROM offer WHERE offer_id = ${data.offerId}::uuid FOR UPDATE`;
+      if (!offer || offer.status !== 'active') {
+        throw new ConflictException('Offer is unavailable');
       }
 
       const requestedAmount = new Prisma.Decimal(data.assetAmount);
@@ -85,15 +72,21 @@ export class OrderRepository extends BaseRepository {
       });
       const usedAmount = reserved._sum.assetAmount ?? new Prisma.Decimal(0);
       const remaining = maxAmount.minus(usedAmount);
-
-      if (
-        requestedAmount.lessThan(minAmount) ||
-        requestedAmount.greaterThan(remaining)
-      ) {
+      if (requestedAmount.lessThan(minAmount) || requestedAmount.greaterThan(remaining)) {
         throw new ConflictException(
           `Order amount must be at least ${minAmount.toString()} and no more than the remaining offer amount ${remaining.toString()}`,
         );
       }
+      const payload = {
+        ...(data.orderId ? { orderId: data.orderId } : {}),
+        offerId: data.offerId,
+        buyerId: data.buyerId,
+        sellerId: data.sellerId,
+        assetAmount: data.assetAmount,
+        fiatAmount: data.fiatAmount,
+        orderStatus: data.orderStatus || undefined,
+        expiresAt: data.expiresAt ? new Date(data.expiresAt) : undefined,
+      } as Prisma.OrderUncheckedCreateInput;
 
       const order = await tx.order.create({ data: payload });
 
@@ -113,7 +106,6 @@ export class OrderRepository extends BaseRepository {
         escrowId = escrow.escrowId;
       }
 
-      // Keep an offer available while it still has reservable capacity.
       const totalReserved = usedAmount.plus(requestedAmount);
       await tx.offer.update({
         where: { offerId: data.offerId },
@@ -123,6 +115,20 @@ export class OrderRepository extends BaseRepository {
     });
 
     return created;
+  }
+
+  async cancelAndReleaseReservation(orderId: string): Promise<Order> {
+    return this.prisma.$transaction(async (tx) => {
+      const order = await tx.order.update({
+        where: { orderId },
+        data: { orderStatus: ORDER_STATUS.CANCELLED },
+      });
+      await tx.offer.updateMany({
+        where: { offerId: order.offerId, executed: true },
+        data: { executed: false },
+      });
+      return order;
+    });
   }
 
   search(
@@ -137,6 +143,22 @@ export class OrderRepository extends BaseRepository {
       orderBy: { orderId: 'desc' },
       include: ORDER_DETAIL_INCLUDE,
     });
+  }
+
+  async searchPage(where: Record<string, unknown>, skip = 0, take = 20) {
+    const [items, total] = await Promise.all([
+      this.search(where, skip, take),
+      this.prisma.order.count({ where: where as Prisma.OrderWhereInput }),
+    ]);
+    const hasMore = skip + items.length < total;
+    return {
+      items,
+      total,
+      skip,
+      take,
+      hasMore,
+      nextSkip: hasMore ? skip + items.length : null,
+    };
   }
 
   findById(id: string): Promise<OrderWithRelations | null> {
