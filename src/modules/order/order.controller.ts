@@ -44,9 +44,24 @@ export class OrderController {
     return this.service.list(p, q);
   }
 
+  @Get('creation/:idempotencyKey')
+  @UseGuards(JwtAuthGuard, SetupCompleteGuard)
+  getCreationStatus(
+    @Param('idempotencyKey') idempotencyKey: string,
+    @CurrentUser() user: { userId: string },
+  ) {
+    return this.service.getCreationStatus(idempotencyKey, user.userId);
+  }
+
   @Get('user-stats/:userId')
-  getUserStats(@Param('userId') userId: string) {
-    return this.service.getUserStats(userId);
+  @UseGuards(JwtAuthGuard)
+  getUserStats(
+    @Param('userId') userId: string,
+    @CurrentUser() user: { userId: string },
+  ) {
+    // Stats are private account metrics: only the owner or an administrator
+    // may read them. The service returns counters only, without order details.
+    return this.service.getUserStats(userId, user.userId);
   }
 
   // Intentionally guarded with JwtAuthGuard only, not KycVerifiedGuard:

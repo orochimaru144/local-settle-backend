@@ -5,9 +5,9 @@ jest.mock('@stellar/stellar-sdk', () => ({
 import { ConfigService } from '@nestjs/config';
 import { StellarService } from './stellar.service';
 
-describe('StellarService.getTransactions pagination', () => {
+describe('StellarService.getTransactions', () => {
   const publicKey = `G${'A'.repeat(55)}`;
-  const payment = (id: string) => ({
+  const payment = (id: string, overrides: Record<string, unknown> = {}) => ({
     id,
     transaction_hash: `hash-${id}`,
     created_at: '2026-10-17T00:00:00Z',
@@ -15,7 +15,8 @@ describe('StellarService.getTransactions pagination', () => {
     amount: '1',
     asset_type: 'native',
     from: publicKey,
-    to: 'G' + 'B'.repeat(55),
+    to: `G${'B'.repeat(55)}`,
+    ...overrides,
   });
 
   function setup(records: unknown[]) {
@@ -32,6 +33,42 @@ describe('StellarService.getTransactions pagination', () => {
     });
     return { service, query };
   }
+
+  it('distinguishes native XLM from issued assets without changing legacy fields', async () => {
+    const issuer = `G${'C'.repeat(55)}`;
+    const { service } = setup([
+      payment('1', { to: issuer }),
+      payment('2', {
+        amount: '2',
+        asset_type: 'credit_alphanum4',
+        asset_code: 'USD',
+        asset_issuer: issuer,
+        from: issuer,
+        to: publicKey,
+      }),
+    ]);
+
+    const result = await service.getTransactions(publicKey);
+
+    expect(result.records[0]).toEqual(
+      expect.objectContaining({
+        asset: 'XLM',
+        asset_issuer: null,
+        asset_descriptor: { type: 'native', code: 'XLM', issuer: null },
+      }),
+    );
+    expect(result.records[1]).toEqual(
+      expect.objectContaining({
+        asset: 'USD',
+        asset_issuer: issuer,
+        asset_descriptor: {
+          type: 'credit_alphanum4',
+          code: 'USD',
+          issuer,
+        },
+      }),
+    );
+  });
 
   it('returns a continuation cursor when Horizon has another record', async () => {
     const { service, query } = setup([payment('200'), payment('199')]);

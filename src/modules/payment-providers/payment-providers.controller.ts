@@ -1,5 +1,6 @@
 import { BadRequestException, Controller, Get, Query } from '@nestjs/common';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { validatePaymentProviderMetadata } from './payment-provider-metadata.validator';
 
 const PROVIDER_TYPES = ['MOBILE', 'PLATFORM', 'BANK'] as const;
 
@@ -27,7 +28,7 @@ export class PaymentProvidersController {
     if (type && !PROVIDER_TYPES.includes(type.trim().toUpperCase() as (typeof PROVIDER_TYPES)[number])) {
       throw new BadRequestException('Unsupported payment-provider type');
     }
-    return this.prisma.payment_provider.findMany({
+    const providers = await this.prisma.payment_provider.findMany({
       where: {
         is_active: true,
         ...(country ? { country_code: { equals: normalizeCountryCode(country), mode: 'insensitive' } } : {}),
@@ -35,5 +36,12 @@ export class PaymentProvidersController {
       },
       orderBy: { name: 'asc' },
     });
+    return providers.map((provider) => ({
+      ...provider,
+      metadataSchemaVersion: validatePaymentProviderMetadata(
+        provider.type,
+        provider.metadata,
+      ),
+    }));
   }
 }

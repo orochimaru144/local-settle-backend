@@ -44,7 +44,15 @@ import {
 } from '../file-storage/file-storage.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
+import { createEvidenceObjectKey } from '../file-storage/evidence-object-key.util';
 import { createHash } from 'crypto';
+
+export interface EscrowAuditContext {
+  userId?: string;
+  ipAddress?: string;
+  userAgent?: string;
+  correlationId?: string;
+}
 
 @Injectable()
 export class EscrowService {
@@ -223,6 +231,7 @@ export class EscrowService {
       deployResult.unsignedTransaction,
       deployerSecret,
       this.getNetworkPassphrase(),
+      'deploy',
     );
 
     if (broadcastResult.status !== 'SUCCESS' || !broadcastResult.contractId) {
@@ -453,7 +462,6 @@ export class EscrowService {
       (file.mimetype === 'image/jpeg' && isJpeg) ||
       (file.mimetype === 'image/webp' && isWebp) ||
       (file.mimetype === 'application/pdf' && isPdf);
-
     if (!signatureMatchesMime) {
       throw new AppException(
         ErrorCode.VALIDATION_ERROR,
@@ -462,6 +470,14 @@ export class EscrowService {
     }
 
     const escrow = await this.getOrFail(id);
+    const key = createEvidenceObjectKey(
+      escrow.escrowId,
+      file.originalname,
+      file.mimetype,
+    );
+    const extensionByType: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'application/pdf': 'pdf' };
+    const safeCandidate = file.originalname.split(/[\\/]/).pop()?.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 180);
+    const evidenceFileName = safeCandidate && safeCandidate !== '.' && safeCandidate !== '..' ? safeCandidate : `evidence.${extensionByType[file.mimetype]}`;
     if (!userId) {
       throw new AppException(
         ErrorCode.UNAUTHORIZED_ACTION,
@@ -474,14 +490,21 @@ export class EscrowService {
       Number(this.config.get('EVIDENCE_USER_DAILY_BYTES')) || 50 * 1024 * 1024;
     const orderLimit =
       Number(this.config.get('EVIDENCE_ORDER_DAILY_BYTES')) || 20 * 1024 * 1024;
+    if (file.size < 1 || file.size > maxFileBytes) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Evidence file exceeds the configured size limit',
+      );
+    }
     const now = Date.now();
     const expiresAt = now + 24 * 60 * 60 * 1000;
-    const userKey = `user:${userId}`;
-    const orderKey = `order:${escrow.orderId}`;
-    const userUsage = this.getEvidenceUsage(userKey, now, expiresAt);
-    const orderUsage = this.getEvidenceUsage(orderKey, now, expiresAt);
+    const userUsage = this.getEvidenceUsage(`user:${userId}`, now, expiresAt);
+    const orderUsage = this.getEvidenceUsage(
+      `order:${escrow.orderId}`,
+      now,
+      expiresAt,
+    );
     if (
-      file.size > maxFileBytes ||
       userUsage.bytes + file.size > userLimit ||
       orderUsage.bytes + file.size > orderLimit
     ) {
@@ -490,12 +513,8 @@ export class EscrowService {
         'Evidence upload quota exceeded',
       );
     }
-    // Reserve synchronously before the first await so concurrent requests cannot
-    // both pass the same quota check. Failed uploads release this reservation.
     userUsage.bytes += file.size;
     orderUsage.bytes += file.size;
-    const ext = file.originalname.split('.').pop() || 'jpg';
-    const key = `evidence/${escrow.escrowId}/${Date.now()}.${ext}`;
 
     try {
       const result = await this.fileStorage.uploadFile({
@@ -507,14 +526,34 @@ export class EscrowService {
       });
       await this.repo.update(id, {
         evidenceUrl: result.url,
+        evidenceKey: key,
         evidenceUploadedAt: new Date(),
+        evidenceFileName,
+        evidenceContentType: file.mimetype,
+        evidenceSize: file.size,
       });
-      return { url: result.url };
+      return { url: `/escrows/${id}/evidence` };
     } catch (error) {
       userUsage.bytes -= file.size;
       orderUsage.bytes -= file.size;
       throw error;
     }
+  }
+
+  async getEvidenceDownloadUrl(id: string) {
+    const escrow = await this.getOrFail(id);
+    if (!escrow.evidenceUrl) {
+      throw new AppException(ErrorCode.RESOURCE_NOT_FOUND, 'Evidence not found');
+    }
+    const expiresInSeconds = 5 * 60;
+    const url = await this.fileStorage.getSignedDownloadUrl(
+      escrow.evidenceUrl,
+      expiresInSeconds,
+    );
+    return {
+      url,
+      expiresAt: new Date(Date.now() + expiresInSeconds * 1000).toISOString(),
+    };
   }
 
   private getEvidenceUsage(key: string, now: number, expiresAt: number) {
@@ -601,6 +640,8 @@ export class EscrowService {
         approveXdr.unsignedTransaction,
         treasurySecret,
         this.getNetworkPassphrase(),
+        'approve',
+        escrow.contractId,
       );
 
       if (broadcastResult.status !== 'SUCCESS') {
@@ -623,7 +664,10 @@ export class EscrowService {
     };
   }
 
-  async syncTransaction(dto: SyncEscrowDto) {
+  async syncTransaction(
+    dto: SyncEscrowDto,
+    auditContext: EscrowAuditContext = {},
+  ) {
     const escrow = await this.getOrFail(dto.escrowId);
     const transactionHash = createHash('sha256')
       .update(dto.signedXdr)
@@ -644,65 +688,90 @@ export class EscrowService {
       };
     }
 
-    this.validateStatusTransition(escrow.escrowStatus, dto.action);
+    try {
+      this.validateStatusTransition(escrow.escrowStatus, dto.action);
 
-    const result = await this.tw.sendTransaction(dto.signedXdr);
-    if (result.status !== 'SUCCESS') {
-      throw new AppException(
-        ErrorCode.ESCROW_SYNC_FAILED,
-        `Blockchain sync failed: ${result.message || 'Unknown error'}`,
-      );
-    }
+      const result = await this.tw.sendTransaction(dto.signedXdr);
+      if (result.status !== 'SUCCESS') {
+        throw new AppException(
+          ErrorCode.ESCROW_SYNC_FAILED,
+          `Blockchain sync failed: ${result.message || 'Unknown error'}`,
+        );
+      }
 
-    const updateData: Record<string, unknown> = {};
-    updateData.lastSyncTxHash = transactionHash;
-    updateData.lastSyncAction = dto.action;
-    switch (dto.action) {
-      case EscrowAction.INITIALIZE:
-        updateData.escrowStatus = 'initialized';
-        if (result.contractId) updateData.contractId = result.contractId;
-        updateData.txHashLock = dto.signedXdr.substring(0, 64);
-        break;
-      case EscrowAction.FUND:
-        updateData.escrowStatus = 'funded';
-        break;
-      case EscrowAction.FIAT_SENT:
-        updateData.escrowStatus = 'fiat_sent';
-        break;
-      case EscrowAction.RELEASE:
-        updateData.escrowStatus = 'released';
-        updateData.txHashRelease = dto.signedXdr.substring(0, 64);
-        break;
-    }
-    await this.repo.update(dto.escrowId, updateData);
+      const updateData: Record<string, unknown> = {};
+      updateData.lastSyncTxHash = transactionHash;
+      updateData.lastSyncAction = dto.action;
+      switch (dto.action) {
+        case EscrowAction.INITIALIZE:
+          updateData.escrowStatus = 'initialized';
+          if (result.contractId) updateData.contractId = result.contractId;
+          updateData.txHashLock = dto.signedXdr.substring(0, 64);
+          break;
+        case EscrowAction.FUND:
+          updateData.escrowStatus = 'funded';
+          break;
+        case EscrowAction.FIAT_SENT:
+          updateData.escrowStatus = 'fiat_sent';
+          break;
+        case EscrowAction.RELEASE:
+          updateData.escrowStatus = 'released';
+          updateData.txHashRelease = dto.signedXdr.substring(0, 64);
+          break;
+      }
+      await this.repo.update(dto.escrowId, updateData);
 
-    if (dto.action === EscrowAction.FUND) {
       await this.auditLogService.create({
-        action: AuditAction.ESCROW_FUNDED,
-        resourceType: 'Escrow',
-        resourceId: dto.escrowId,
-        result: AuditResult.SUCCESS,
-        metadata: { contractId: result.contractId ?? escrow.contractId },
-      });
-    } else if (dto.action === EscrowAction.RELEASE) {
-      await this.auditLogService.create({
-        action: AuditAction.ESCROW_RELEASED,
+        ...auditContext,
+        action: this.auditActionForEscrowAction(dto.action),
         resourceType: 'Escrow',
         resourceId: dto.escrowId,
         result: AuditResult.SUCCESS,
         metadata: {
+          action: dto.action,
+          orderId: escrow.orderId,
           contractId: result.contractId ?? escrow.contractId,
-          txHashRelease: updateData.txHashRelease,
+          transactionHash,
         },
       });
-    }
 
-    return {
-      escrowId: dto.escrowId,
-      status: result.status,
-      contractId: result.contractId ?? escrow.contractId,
-      newEscrowStatus: updateData.escrowStatus,
-    };
+      return {
+        escrowId: dto.escrowId,
+        status: result.status,
+        contractId: result.contractId ?? escrow.contractId,
+        newEscrowStatus: updateData.escrowStatus,
+      };
+    } catch (error) {
+      await this.auditLogService.create({
+        ...auditContext,
+        action: this.auditActionForEscrowAction(dto.action),
+        resourceType: 'Escrow',
+        resourceId: dto.escrowId,
+        result: AuditResult.FAILURE,
+        metadata: {
+          action: dto.action,
+          orderId: escrow.orderId,
+          contractId: escrow.contractId,
+          transactionHash,
+        },
+      });
+      throw error;
+    }
+  }
+
+  private auditActionForEscrowAction(action: EscrowAction): AuditAction {
+    switch (action) {
+      case EscrowAction.INITIALIZE:
+        return AuditAction.ESCROW_CREATED;
+      case EscrowAction.FUND:
+        return AuditAction.ESCROW_FUNDED;
+      case EscrowAction.FIAT_SENT:
+        return AuditAction.ESCROW_FIAT_SENT;
+      case EscrowAction.RELEASE:
+        return AuditAction.ESCROW_RELEASED;
+      default:
+        return AuditAction.ESCROW_CREATED;
+    }
   }
 
   async getStatus(id: string) {
@@ -752,15 +821,16 @@ export class EscrowService {
     ) as Promise<EscrowOnChain>;
   }
 
-  list(p: PaginationDto, orderId?: string) {
-    if (orderId) {
-      return this.repo.findMany({
-        skip: p.skip,
-        take: p.take,
-        where: { orderId },
-      });
-    }
-    return this.repo.findMany({ skip: p.skip, take: p.take });
+  async list(p: PaginationDto, orderId?: string) {
+    const items = await this.repo.findMany({
+      skip: p.skip,
+      take: p.take,
+      ...(orderId ? { where: { orderId } } : {}),
+    });
+    return items.map((item) => ({
+      ...item,
+      evidenceUrl: item.evidenceUrl ? `/escrows/${item.escrowId}/evidence` : null,
+    }));
   }
 
   async get(id: string) {
@@ -771,7 +841,10 @@ export class EscrowService {
         `Escrow ${id} not found`,
       );
     }
-    return item;
+    return {
+      ...item,
+      evidenceUrl: item.evidenceUrl ? `/escrows/${item.escrowId}/evidence` : null,
+    };
   }
 
   update(id: string, dto: UpdateEscrowDto) {

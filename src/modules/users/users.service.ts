@@ -17,6 +17,7 @@ import { PaymentMethodValidatorService } from '../payment-methods/payment-method
 import { USER_PUBLIC_SELECT, PublicUser } from '../../common/prisma-selects';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditAction, AuditResult } from '../audit-log/enums/audit-action.enum';
+import { validatePaymentProviderMetadata } from '../payment-providers/payment-provider-metadata.validator';
 import { normalizeAlias } from './alias-normalization';
 
 export interface AliasAvailability {
@@ -98,17 +99,14 @@ export class UsersService {
     if (typeof accountData.alias === 'string') {
       accountData.aliasNormalized = normalizeAlias(accountData.alias);
     }
-    const updatedUser: AppUser = (await this.repo.update(userId, {
-      ...accountData,
-      pendingAccountInfo: false,
-    })) as AppUser;
 
     void bankName;
     void accountHolderName;
     void accountNumber;
 
+    let provider: Awaited<ReturnType<PrismaService['payment_provider']['findUnique']>> = null;
     if (providerId && accountIdentifier) {
-      const provider = await this.prisma.payment_provider.findUnique({
+      provider = await this.prisma.payment_provider.findUnique({
         where: { provider_id: providerId },
       });
 
@@ -119,6 +117,8 @@ export class UsersService {
         );
       }
 
+      validatePaymentProviderMetadata(provider.type, provider.metadata);
+
       this.paymentMethodValidator.validate(
         {
           type: provider.type,
@@ -128,19 +128,49 @@ export class UsersService {
         },
         accountIdentifier,
       );
+    }
 
-      await this.prisma.paymentMethod.create({
+    const updatedUser = await this.prisma.$transaction(async (tx) => {
+      const user = await tx.appUser.update({
+        where: { userId },
         data: {
-          userId,
-          providerId,
-          type: provider.type,
-          accountIdentifier,
-          identificationNumber,
-          beneficiaryName,
-          description,
+          ...accountData,
+          pendingAccountInfo: false,
         },
       });
-    }
+
+      if (provider && providerId && accountIdentifier) {
+        const existingMethod = await tx.paymentMethod.findFirst({
+          where: { userId, providerId, accountIdentifier },
+          select: { paymentId: true },
+        });
+        if (!existingMethod) {
+          await tx.paymentMethod.create({
+            data: {
+              userId,
+              providerId,
+              type: provider.type,
+              accountIdentifier,
+              identificationNumber,
+              beneficiaryName,
+              description,
+            },
+          });
+        }
+      }
+
+      await tx.auditLog.create({
+        data: {
+          userId,
+          action: AuditAction.USER_ACCOUNT_SETUP,
+          resourceType: 'User',
+          resourceId: userId,
+          result: AuditResult.SUCCESS,
+          metadata: { paymentMethodIncluded: Boolean(providerId && accountIdentifier) },
+        },
+      });
+      return user;
+    });
 
     const { access_token } = await Promise.resolve(
       this.authService.finalizeSetup(userId, updatedUser.publicKey),

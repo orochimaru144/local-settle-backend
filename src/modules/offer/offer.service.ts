@@ -113,13 +113,24 @@ export class OfferService {
     actorId: string,
   ): Promise<Offer> {
     const current = await this.repo.findById(id);
-    if (!current) throw new NotFoundException('Offer not found');
-    if (current.creatorId !== actorId && (await this.repo.getUserRole(actorId)) !== 'admin') {
+    if (!current) {
+      throw new AppException(ErrorCode.OFFER_NOT_FOUND, `Offer ${id} not found`);
+    }
+    if (
+      current.creatorId !== actorId &&
+      (await this.repo.getUserRole(actorId)) !== 'admin'
+    ) {
       throw new ForbiddenException('Only the offer creator or an admin can update it');
     }
-    const updated = (await this.repo.update(
+    const { expectedVersion, ...changes } = dto;
+    const updated = (await this.repo.updateWithVersion(
       id,
-      dto as unknown as Record<string, unknown>,
+      changes as Record<string, unknown>,
+      expectedVersion,
+    )) as Offer;
+      id,
+      changes as Record<string, unknown>,
+      expectedVersion,
     )) as Offer;
 
     await this.auditLogService.create({

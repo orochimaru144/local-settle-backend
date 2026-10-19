@@ -70,4 +70,8 @@ export class UpdateUserDto {
   @IsOptional()
   @IsBoolean()
   securityUpdates?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  messageReceiptsEnabled?: boolean;
 }

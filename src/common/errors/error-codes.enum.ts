@@ -21,11 +21,13 @@ export enum ErrorCode {
 
   // ── Offer ────────────────────────────────────────────────────────────
   OFFER_NOT_FOUND = 'OFFER_NOT_FOUND',
+  OFFER_VERSION_CONFLICT = 'OFFER_VERSION_CONFLICT',
 
   // ── Order ────────────────────────────────────────────────────────────
   ORDER_NOT_FOUND = 'ORDER_NOT_FOUND',
   INVALID_ORDER_STATUS = 'INVALID_ORDER_STATUS',
   ORDER_CANCELLATION_NOT_ALLOWED = 'ORDER_CANCELLATION_NOT_ALLOWED',
+  ORDER_INVALID_TRANSITION = 'ORDER_INVALID_TRANSITION',
 
   // ── Escrow ───────────────────────────────────────────────────────────
   ESCROW_NOT_FOUND = 'ESCROW_NOT_FOUND',

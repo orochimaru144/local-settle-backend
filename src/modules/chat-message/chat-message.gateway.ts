@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import {
@@ -30,16 +31,23 @@ interface ChatJwtPayload {
 interface AuthenticatedSocketData {
   userId: string;
   publicKey?: string;
+  correlationId: string;
 }
 
 interface ChatServerEvents {
   [ChatEvent.MESSAGE_CREATED]: (message: CreatedChatMessage) => void;
+  [ChatEvent.MESSAGE_RECEIPT]: (receipt: {
+    orderId: string;
+    messageIds: string[];
+    state: 'delivered' | 'read';
+    updatedAt: Date;
+  }) => void;
   [ChatEvent.CHAT_ERROR]: (error: ChatError) => void;
   [ChatEvent.USER_JOINED]: (event: { orderId: string; userId: string }) => void;
   [ChatEvent.USER_LEFT]: (event: { orderId: string; userId: string }) => void;
 }
 
-type CreatedChatMessage = ChatMessage & { clientMessageId?: string };
+type CreatedChatMessage = ChatMessage & { clientMessageId?: string; attachments?: import('./chat-message.service').ChatAttachmentDownload[] };
 
 type ChatSocket = Socket<
   Record<string, never>,
@@ -80,6 +88,16 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
 
   afterInit(server: Server): void {
     server.use((socket, next) => {
+      const client = socket as ChatSocket;
+      const incoming =
+        client.handshake.auth?.correlationId ??
+        client.handshake.headers['x-correlation-id'];
+      client.data.correlationId =
+        typeof incoming === 'string' &&
+        incoming.length <= 64 &&
+        /^[A-Za-z0-9._-]+$/.test(incoming)
+          ? incoming
+          : randomUUID();
       void this.authenticateSocket(socket as ChatSocket).then(
         () => next(),
         (error: unknown) =>
@@ -132,6 +150,44 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
       });
     }
 
+    const delivered = await this.chatMessages.markDelivered(
+      orderId,
+      client.data.userId,
+    );
+    if (delivered) this.server.to(room).emit(ChatEvent.MESSAGE_RECEIPT, delivered);
+
+    return { ok: true };
+  }
+
+  @SubscribeMessage(ChatEvent.MARK_READ)
+  async markRead(
+    @ConnectedSocket() client: ChatSocket,
+    @MessageBody() body: OrderRoomDto,
+  ): Promise<ChatAck> {
+    const orderId = body?.orderId;
+    if (!this.isValidOrderId(orderId)) {
+      return this.fail(
+        client,
+        ChatErrorCode.INVALID_ORDER_ID,
+        'Invalid order ID.',
+        orderId,
+      );
+    }
+    const accessError = await this.getAccessError(client, orderId);
+    if (accessError) return this.failWith(client, accessError);
+
+    const room = this.roomFor(orderId);
+    if (!client.rooms.has(room)) {
+      return this.fail(
+        client,
+        ChatErrorCode.NOT_IN_ORDER_ROOM,
+        'Join the order room before marking messages as read.',
+        orderId,
+      );
+    }
+
+    const receipt = await this.chatMessages.markRead(orderId, client.data.userId);
+    if (receipt) this.server.to(room).emit(ChatEvent.MESSAGE_RECEIPT, receipt);
     return { ok: true };
   }
 
@@ -182,8 +238,9 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
       );
     }
 
-    const validation = validateChatMessageContent(body?.content);
-    if (!validation.valid) {
+    const evidenceIds = body?.attachmentEvidenceIds ?? [];
+    const validation = validateChatMessageContent(body?.content ?? '');
+    if (!validation.valid && !(validation.reason === 'empty' && evidenceIds.length > 0)) {
       const code =
         validation.reason === 'empty' || validation.reason === 'too_long'
           ? ChatErrorCode.EMPTY_MESSAGE
@@ -200,7 +257,7 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
         orderId,
       );
     }
-    const { content } = validation;
+    const content = validation.valid ? validation.content : '';
     if (body?.clientMessageId && !this.isValidOrderId(body.clientMessageId)) {
       return this.fail(
         client,
@@ -222,22 +279,21 @@ export class ChatMessageGateway implements OnGatewayInit, OnGatewayConnection {
 
     const accessError = await this.getAccessError(client, orderId);
     if (accessError) return this.failWith(client, accessError);
+    if (evidenceIds.length && !(await this.chatMessages.canAccessOrder(orderId, client.data.userId))) {
+      return this.fail(client, ChatErrorCode.UNAUTHORIZED_ORDER_ACCESS, 'Only order participants can attach evidence.', orderId);
+    }
 
     try {
-      const message = await this.chatMessages.create({
-        orderId,
-        senderId: client.data.userId,
-        content,
-      });
-      const createdMessage: CreatedChatMessage = {
-        ...message,
-        clientMessageId: body.clientMessageId,
-      };
+      const message = await this.chatMessages.createFromChat({ orderId, senderId: client.data.userId, content, attachmentEvidenceIds: evidenceIds, clientMessageId: body.clientMessageId });
+      const attachments = await this.chatMessages.getSignedAttachmentsForMessage(message.messageId, client.data.userId);
+      const publicMessage = { ...message } as ChatMessage & { attachmentRefs?: unknown };
+      delete publicMessage.attachmentRefs;
+      const createdMessage: CreatedChatMessage = { ...publicMessage, clientMessageId: body.clientMessageId, attachments };
       this.server.to(room).emit(ChatEvent.MESSAGE_CREATED, createdMessage);
       return { ok: true, data: createdMessage };
     } catch (error) {
       this.logger.error(
-        `Failed to persist chat message for order ${orderId}`,
+        `Failed to persist chat message for order ${orderId} correlationId=${client.data.correlationId}`,
         error instanceof Error ? error.stack : undefined,
       );
       return this.fail(

@@ -27,6 +27,8 @@ import {
 import { FiatSentDto } from './dto/fiat-sent.dto';
 import { ReleaseEscrowDto } from './dto/release-escrow.dto';
 import { SyncEscrowDto } from './dto/sync-escrow.dto';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import type { EscrowAuditContext } from './escrow.service';
 import { EscrowService } from './escrow.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { SetupCompleteGuard } from '../auth/setup-complete.guard';
@@ -85,8 +87,23 @@ export class EscrowController {
   @Post('sync')
   @UseGuards(JwtAuthGuard, ResourceOwnerGuard)
   @ResourceOwner(ResourceType.ESCROW, 'escrowId')
-  sync(@Body() dto: SyncEscrowDto) {
-    return this.service.syncTransaction(dto);
+  sync(
+    @Body() dto: SyncEscrowDto,
+    @Req() request: AuthenticatedRequest,
+    @CurrentUser() user: { userId: string },
+  ) {
+    const correlationHeader = request.headers['x-correlation-id'];
+    const requestIdHeader = request.headers['x-request-id'];
+    const auditContext: EscrowAuditContext = {
+      userId: user.userId,
+      ipAddress: request.ip,
+      userAgent: request.headers['user-agent'],
+      correlationId:
+        (typeof correlationHeader === 'string' && correlationHeader) ||
+        (typeof requestIdHeader === 'string' && requestIdHeader) ||
+        undefined,
+    };
+    return this.service.syncTransaction(dto, auditContext);
   }
 
   /** Mark that the buyer has sent fiat payment */
@@ -120,6 +137,14 @@ export class EscrowController {
       file,
       request?.user?.userId ?? request?.user?.sub,
     );
+  }
+
+  /** Return a short-lived evidence link to an order participant. */
+  @Get(':id/evidence')
+  @UseGuards(JwtAuthGuard, ResourceOwnerGuard)
+  @ResourceOwner(ResourceType.ESCROW)
+  getEvidenceDownloadUrl(@Param('id') id: string) {
+    return this.service.getEvidenceDownloadUrl(id);
   }
 
   /** Get escrow status with live on-chain data */

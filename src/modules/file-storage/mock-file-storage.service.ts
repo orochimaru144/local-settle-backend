@@ -30,4 +30,12 @@ export class MockFileStorageService extends FileStorageService {
     });
   }
 
+  async getSignedDownloadUrl(
+    storedUrl: string,
+    expiresInSeconds: number,
+  ): Promise<string> {
+    const expires = Math.floor(Date.now() / 1000) + expiresInSeconds;
+    return `${storedUrl}?expires=${expires}&signature=mock`;
+  }
+
 }

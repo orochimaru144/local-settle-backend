@@ -17,6 +17,6 @@ import { SetupCompleteGuard } from '../auth/setup-complete.guard';
     TrustlessWorkService,
     SetupCompleteGuard,
   ],
-  exports: [EscrowService],
+  exports: [EscrowService, TrustlessWorkService],
 })
 export class EscrowModule {}

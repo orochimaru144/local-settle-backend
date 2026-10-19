@@ -206,12 +206,23 @@ export class TrustlessWorkService {
     unsignedXdr: string,
     signerSecret: string,
     networkPassphrase: string,
+    expectedOperation: 'deploy' | 'approve',
+    expectedContractId?: string,
   ): Promise<SendTransactionResponse> {
     const keypair = StellarSdk.Keypair.fromSecret(signerSecret);
     const transaction = StellarSdk.TransactionBuilder.fromXDR(
       unsignedXdr,
       networkPassphrase,
     );
+
+    this.validateBackendSigningRequest(
+      transaction,
+      keypair.publicKey(),
+      networkPassphrase,
+      expectedOperation,
+      expectedContractId,
+    );
+
     transaction.sign(keypair);
     const signedXdr = transaction.toXDR();
 
@@ -220,6 +231,119 @@ export class TrustlessWorkService {
     );
 
     return this.sendTransaction(signedXdr);
+  }
+
+  /**
+   * Trustless Work returns unsigned XDR, but the backend must only add its
+   * operator signature to the one operation it requested. Check the network
+   * configured by the application, source account, operation kind, and (for
+   * approvals) the target contract and function before touching the key.
+   */
+  private validateBackendSigningRequest(
+    transaction: StellarSdk.Transaction,
+    signerAddress: string,
+    networkPassphrase: string,
+    expectedOperation: 'deploy' | 'approve',
+    expectedContractId?: string,
+  ): void {
+    if (transaction.constructor.name === 'FeeBumpTransaction') {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Refusing to sign an unexpected fee-bump transaction envelope.',
+      );
+    }
+
+    const configuredNetwork = (
+      this.config.get<string>('STELLAR_NETWORK') ?? 'testnet'
+    ).toLowerCase();
+    const configuredPassphrase =
+      configuredNetwork === 'public'
+        ? 'Public Global Stellar Network ; September 2015'
+        : 'Test SDF Network ; September 2015';
+
+    if (networkPassphrase !== configuredPassphrase) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Refusing to sign a transaction for an unexpected Stellar network.',
+      );
+    }
+
+    if (transaction.source !== signerAddress) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Refusing to sign a transaction whose source is not the configured operator.',
+      );
+    }
+
+    if (
+      transaction.operations.length !== 1 ||
+      transaction.operations[0]?.type !== 'invokeHostFunction'
+    ) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Refusing to sign an unexpected transaction operation.',
+      );
+    }
+
+    const hostFunction = transaction.operations[0].func as unknown as Record<
+      string,
+      () => unknown
+    >;
+    if (expectedOperation === 'deploy') {
+      if (
+        !this.matchesHostFunction(hostFunction, [
+          'createContract',
+          'createContractV2',
+        ])
+      ) {
+        throw new AppException(
+          ErrorCode.VALIDATION_ERROR,
+          'Refusing to sign an XDR that does not deploy the expected escrow contract.',
+        );
+      }
+      return;
+    }
+
+    if (!expectedContractId || !this.matchesHostFunction(hostFunction, ['invokeContract'])) {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Refusing to sign an XDR that does not invoke the expected escrow contract.',
+      );
+    }
+
+    try {
+      const invoke = hostFunction.invokeContract() as {
+        contractAddress: () => { contractId: () => { toXDR: () => Uint8Array } };
+        functionName: () => { toString: () => string };
+      };
+      const rawContractId = invoke.contractAddress().contractId().toXDR();
+      const contractId = StellarSdk.StrKey.encodeContract(Buffer.from(rawContractId));
+      if (
+        contractId !== expectedContractId ||
+        invoke.functionName().toString() !== 'approve_milestone'
+      ) {
+        throw new Error('Unexpected contract or function');
+      }
+    } catch {
+      throw new AppException(
+        ErrorCode.VALIDATION_ERROR,
+        'Refusing to sign an XDR that does not approve the expected escrow milestone.',
+      );
+    }
+  }
+
+  /** XDR union accessors throw when the requested arm is not selected. */
+  private matchesHostFunction(
+    hostFunction: Record<string, () => unknown>,
+    allowedArms: string[],
+  ): boolean {
+    return allowedArms.some((arm) => {
+      try {
+        return typeof hostFunction[arm] === 'function' && Boolean(hostFunction[arm]());
+      } catch {
+        return false;
+      }
+    });
   }
 
   // ─── Query ─────────────────────────────────────────────────────────────────

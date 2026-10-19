@@ -1,5 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { AxiosError, AxiosResponse } from 'axios';
+import * as StellarSdk from '@stellar/stellar-sdk';
 import { TrustlessWorkService } from './trustless-work.service';
 
 describe('TrustlessWorkService resilience', () => {
@@ -52,5 +53,102 @@ describe('TrustlessWorkService resilience', () => {
       'Escrow operation failed: upstream unavailable',
     );
     expect(http.post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TrustlessWorkService backend signing guard', () => {
+  const signerAddress = 'G_OPERATOR';
+  const signer = { publicKey: () => signerAddress };
+
+  function setupSigning(operation: Record<string, unknown>) {
+    const service = new TrustlessWorkService({
+      get: jest.fn((key: string) => (key === 'STELLAR_NETWORK' ? 'testnet' : undefined)),
+    } as unknown as ConfigService);
+    const transaction = {
+      source: signerAddress,
+      operations: [operation],
+      sign: jest.fn(),
+      toXDR: jest.fn().mockReturnValue('signed-xdr'),
+    };
+    jest.spyOn(StellarSdk.Keypair, 'fromSecret').mockReturnValue(signer as never);
+    jest
+      .spyOn(StellarSdk.TransactionBuilder, 'fromXDR')
+      .mockReturnValue(transaction as never);
+    const broadcast = jest
+      .spyOn(service, 'sendTransaction')
+      .mockResolvedValue({ status: 'SUCCESS' });
+    return { service, transaction, broadcast };
+  }
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('signs the known escrow deployment operation when source and network match', async () => {
+    const { service, transaction, broadcast } = setupSigning({
+      type: 'invokeHostFunction',
+      func: { createContract: () => ({}) },
+    });
+
+    await expect(
+      service.signAndBroadcast(
+        'fixture-deploy-xdr',
+        'fixture-secret',
+        'Test SDF Network ; September 2015',
+        'deploy',
+      ),
+    ).resolves.toEqual({ status: 'SUCCESS' });
+    expect(transaction.sign).toHaveBeenCalledWith(signer);
+    expect(broadcast).toHaveBeenCalledWith('signed-xdr');
+  });
+
+  it('rejects an unexpected source before signing', async () => {
+    const { service, transaction, broadcast } = setupSigning({
+      type: 'invokeHostFunction',
+      func: { createContract: () => ({}) },
+    });
+    transaction.source = 'G_UNEXPECTED';
+
+    await expect(
+      service.signAndBroadcast(
+        'fixture-deploy-xdr',
+        'fixture-secret',
+        'Test SDF Network ; September 2015',
+        'deploy',
+      ),
+    ).rejects.toThrow('source is not the configured operator');
+    expect(transaction.sign).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unexpected operation before signing', async () => {
+    const { service, transaction, broadcast } = setupSigning({ type: 'payment' });
+
+    await expect(
+      service.signAndBroadcast(
+        'fixture-payment-xdr',
+        'fixture-secret',
+        'Test SDF Network ; September 2015',
+        'deploy',
+      ),
+    ).rejects.toThrow('unexpected transaction operation');
+    expect(transaction.sign).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unexpected configured network before signing', async () => {
+    const { service, transaction, broadcast } = setupSigning({
+      type: 'invokeHostFunction',
+      func: { createContract: () => ({}) },
+    });
+
+    await expect(
+      service.signAndBroadcast(
+        'fixture-deploy-xdr',
+        'fixture-secret',
+        'Public Global Stellar Network ; September 2015',
+        'deploy',
+      ),
+    ).rejects.toThrow('unexpected Stellar network');
+    expect(transaction.sign).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalled();
   });
 });
